@@ -65,6 +65,7 @@ Shader "kode80/SSR"
 		 	
 		 	float4x4 _NormalMatrix;
 		 	float2 _RenderBufferSize;
+		 	float2 _OneDividedByRenderBufferSize;		// Optimization: removes 2 divisions every itteration
 
 			struct v2f {
 			   float4 position : SV_POSITION;
@@ -146,7 +147,6 @@ Shader "kode80/SSR"
 			    
 			    // If the line is degenerate, make it cover at least one pixel
 			    // to avoid handling zero-pixel extent as a special case later
-			    //P1 += float2( (distanceSquared(P0, P1) < 0.0001) ? 0.01 : 0.0);
 			    P1 += (distanceSquared(P0, P1) < 0.0001) ? 0.01 : 0.0;
 			    
 			    float2 delta = P1 - P0;
@@ -181,66 +181,103 @@ Shader "kode80/SSR"
 			    dP *= pixelStride; dQ *= pixelStride; dk *= pixelStride;
 			    P0 += dP * jitter; Q0 += dQ * jitter; k0 += dk * jitter;
 			 
-			    float i, zA, zB;
+			    float i, zA = 0.0, zB = 0.0;
 			    
 			    // Track ray step and derivatives in a float4 to parallelize
 			    float4 pqk = float4( P0, Q0.z, k0);
 			    float4 dPQK = float4( dP, dQ.z, dk);
+			    bool intersect = false;
 			    
-			    for( i=0; i<_Iterations; i++)
+			    for( i=0; i<_Iterations && intersect == false; i++)
 			    {
 			    	pqk += dPQK;
 			    	
-			    	zA = (dPQK.z * -0.5 + pqk.z) / (dPQK.w * -0.5 + pqk.w);
+			    	zA = zB;
 			    	zB = (dPQK.z * 0.5 + pqk.z) / (dPQK.w * 0.5 + pqk.w);
 			    	swapIfBigger( zB, zA);
 			    	
 			    	hitPixel = permute ? pqk.yx : pqk.xy;
-			    	hitPixel /= _RenderBufferSize;
+			    	hitPixel *= _OneDividedByRenderBufferSize;
 			        
-			        if( rayIntersectsDepthBF( zA, zB, hitPixel))
-			        {
-			        	if( pixelStride > 1.0)
-			        	{
-			        		// Binary search refinement
-					    	pqk -= dPQK;
-					    	dPQK /= pixelStride;
-					    	
-					    	float originalStride = pixelStride * 0.5;
-			        		float stride = originalStride;
-			        		
-			        		for( float j=0; j<_BinarySearchIterations; j++)
-						    {
-						    	pqk += dPQK * stride;
-						    	
-						    	zA = (dPQK.z * 0.5 + pqk.z) / (dPQK.w * 0.5 + pqk.w);
-			    				zB = (dPQK.z * -0.5 + pqk.z) / (dPQK.w * -0.5 + pqk.w);
-			    				swapIfBigger( zB, zA);
-						    	
-						    	hitPixel = permute ? pqk.yx : pqk.xy;
-						    	hitPixel /= _RenderBufferSize;
-						        
-						        originalStride *= 0.5;
-						        stride = rayIntersectsDepthBF( zA, zB, hitPixel) ? -originalStride : originalStride;
-						    }
-			        	}
-			        	
-			        	Q0.xy += dQ.xy * i;
-			        	Q0.z = pqk.z;
-			        	hitPoint = Q0 / pqk.w;
-			        	iterationCount = i;// * (1.0 - strideScaler);
-			        	return true;
-			        }
+			        intersect = rayIntersectsDepthBF( zA, zB, hitPixel);
 			    }
 			    
-			    return false;
+	        	// Binary search refinement
+	    		if( pixelStride > 1.0 && intersect)
+	        	{
+			    	pqk -= dPQK;
+			    	dPQK /= pixelStride;
+			    	
+			    	float originalStride = pixelStride * 0.5;
+	        		float stride = originalStride;
+	        		
+	        		zA = pqk.z / pqk.w;
+	        		zB = zA;
+	        		
+	        		for( float j=0; j<_BinarySearchIterations; j++)
+				    {
+				    	pqk += dPQK * stride;
+				    	
+				    	zA = zB;
+	    				zB = (dPQK.z * -0.5 + pqk.z) / (dPQK.w * -0.5 + pqk.w);
+	    				swapIfBigger( zB, zA);
+				    	
+				    	hitPixel = permute ? pqk.yx : pqk.xy;
+				    	hitPixel *= _OneDividedByRenderBufferSize;
+				        
+				        originalStride *= 0.5;
+				        stride = rayIntersectsDepthBF( zA, zB, hitPixel) ? -originalStride : originalStride;
+				    }
+	        	}
+
+			    
+	        	Q0.xy += dQ.xy * i;
+	        	Q0.z = pqk.z;
+	        	hitPoint = Q0 / pqk.w;
+	        	iterationCount = i;
+			        	
+			    return intersect;
 			}
 			
+			inline float calculateAlphaForIntersection( bool intersect, 
+					  								   float iterationCount, 
+					  								   float specularStrength,
+					  								   float2 hitPixel,
+					  								   float3 hitPoint,
+					  								   float3 vsRayOrigin,
+					  								   float3 vsRayDirection)
+			{
+				float alpha = min( 1.0, specularStrength * 1.0);
+				
+				// Fade ray hits that approach the maximum iterations
+				alpha *= 1.0 - (iterationCount / _Iterations);
+				
+				// Fade ray hits that approach the screen edge
+				float screenFade = _ScreenEdgeFadeStart;
+				float2 hitPixelNDC = (hitPixel * 2.0 - 1.0);
+				float maxDimension = min( 1.0, max( abs( hitPixelNDC.x), abs( hitPixelNDC.y)));
+				alpha *= 1.0 - (max( 0.0, maxDimension - screenFade) / (1.0 - screenFade));
+				
+				// Fade ray hits base on how much they face the camera
+				float eyeFadeStart = _EyeFadeStart;
+				float eyeFadeEnd = _EyeFadeEnd;
+				swapIfBigger( eyeFadeStart, eyeFadeEnd);
+				
+				float eyeDirection = clamp( vsRayDirection.z, eyeFadeStart, eyeFadeEnd);
+				alpha *= 1.0 - ((eyeDirection - eyeFadeStart) / (eyeFadeEnd - eyeFadeStart));
+				
+				// Fade ray hits based on distance from ray origin
+				alpha *= 1.0 - clamp( distance( vsRayOrigin, hitPoint) / _MaxRayDistance, 0.0, 1.0);
+				
+				alpha *= intersect;
+				
+				return alpha;
+			}
 			
 			half4 frag (v2f i) : COLOR
 			{
 			    half4 specRoughPixel = tex2D( _CameraGBufferTexture1, i.uv);
-				float3 specularStrength = max( max( specRoughPixel.r, specRoughPixel.g), specRoughPixel.b);
+				float3 specularStrength = specRoughPixel.a;
 				
 				float decodedDepth = Linear01Depth( tex2D( _CameraDepthTexture, i.uv).r);
 				
@@ -255,43 +292,20 @@ Shader "kode80/SSR"
 				float3 hitPoint;
 				float iterationCount;
 				
-				float jitter = 0.0;
-				//if( i.uv.x > 0.5)
-				//{
-					float2 uv2 = i.uv * _RenderBufferSize;
-					float c = (uv2.x + uv2.y) * 0.25;
-					jitter = fmod( c, 1.0);
-				//}
+				float2 uv2 = i.uv * _RenderBufferSize;
+				float c = (uv2.x + uv2.y) * 0.25;
+				float jitter = fmod( c, 1.0);
+			
+				bool intersect = traceScreenSpaceRay( vsRayOrigin, vsRayDirection, jitter, hitPixel, hitPoint, iterationCount, i.uv.x > 0.5);
+				float alpha = calculateAlphaForIntersection( intersect, iterationCount, specularStrength, hitPixel, hitPoint, vsRayOrigin, vsRayDirection);
+				hitPixel = lerp( i.uv, hitPixel, intersect);
 				
-				if( traceScreenSpaceRay( vsRayOrigin, vsRayDirection, jitter, hitPixel, hitPoint, iterationCount, i.uv.x > 0.5))
-				{
-					float alpha = min( 1.0, specularStrength * 1.0);
-					
-					// Fade ray hits that approach the maximum iterations
-					alpha *= 1.0 - (iterationCount / _Iterations);
-					
-					// Fade ray hits that approach the screen edge
-					float screenFade = _ScreenEdgeFadeStart;
-					float2 hitPixelNDC = (hitPixel * 2.0 - 1.0);
-					float maxDimension = min( 1.0, max( abs( hitPixelNDC.x), abs( hitPixelNDC.y)));
-					alpha *= 1.0 - (max( 0.0, maxDimension - screenFade) / (1.0 - screenFade));
-					
-					// Fade ray hits base on how much they face the camera
-					float eyeFadeStart = _EyeFadeStart;
-					float eyeFadeEnd = _EyeFadeEnd;
-					swapIfBigger( eyeFadeStart, eyeFadeEnd);
-					
-					float eyeDirection = clamp( vsRayDirection.z, eyeFadeStart, eyeFadeEnd);
-					alpha *= 1.0 - ((eyeDirection - eyeFadeStart) / (eyeFadeEnd - eyeFadeStart));
-					
-					// Fade ray hits based on distance from ray origin
-					alpha *= 1.0 - clamp( distance( vsRayOrigin, hitPoint) / _MaxRayDistance, 0.0, 1.0);
-					
-					specRoughPixel = half4( 1.0);
-					return half4( (tex2D( _MainTex, hitPixel)).rgb * specRoughPixel.rgb, alpha);
-				}
+				// Comment out the line below to get faked specular,
+				// in no way physically correct but will tint based
+				// on spec. Physically correct handling of spec is coming...
+				specRoughPixel = half4( 1.0, 1.0, 1.0, 1.0);
 				
-				return half4( (tex2D( _MainTex, i.uv)).rgb, 0.0);
+				return half4( (tex2D( _MainTex, hitPixel)).rgb * specRoughPixel.rgb, alpha);
 			}
 			
 			ENDCG
